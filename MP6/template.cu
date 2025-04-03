@@ -18,11 +18,66 @@
     }                                                                     \
   } while (0)
 
-__global__ void scan(float *input, float *output, int len) {
+__global__ void scan(float *input, float* aux, float *output, int len, bool NeedAux) {
   //@@ Modify the body of this function to complete the functionality of
   //@@ the scan on the device
   //@@ You may need multiple kernel calls; write your kernels before this
   //@@ function and call them from the host
+  int tx = threadIdx.x;
+  int gx = blockIdx.x*blockDim.x*2 + tx;
+  __shared__ float SharedInput[2*BLOCK_SIZE];
+  // load data into shared memory
+  if(gx < len) {
+    SharedInput[tx] = input[gx];
+  } else {
+    SharedInput[tx] = 0;
+  }
+  if(gx + blockDim.x < len) {
+    SharedInput[tx + blockDim.x] = input[gx + blockDim.x];
+  } else {
+    SharedInput[tx + blockDim.x] = 0;
+  }
+  __syncthreads();
+
+  // reduction
+  for (size_t stride = 1;stride<=BLOCK_SIZE;stride*=2) {
+    int index = (tx+1)*stride*2-1;
+    if(index < 2*BLOCK_SIZE) {
+      SharedInput[index] = SharedInput[index-stride]+SharedInput[index];
+    }
+    __syncthreads();
+  }
+  // distribution
+  for (size_t stride = BLOCK_SIZE / 2;stride > 0; stride /= 2) {
+    int index = (tx+1)*stride*2-1;
+    if(index+stride < 2*BLOCK_SIZE) {
+      SharedInput[index+stride] += SharedInput[index];
+    }
+    __syncthreads();
+  }
+    // Wirte back to global
+    if (gx < len)
+    {
+      output[gx] = SharedInput[tx];
+    }
+  if(gx + blockDim.x < len) {
+    output[gx + blockDim.x] = SharedInput[tx + blockDim.x];
+  }
+  // Wirte to aux
+  if(tx == 0 && NeedAux) {
+    aux[blockIdx.x] = SharedInput[2*BLOCK_SIZE - 1];
+  }
+}
+// Note each thread takes care of two elements
+__global__ void add(float *input, float *aux, int len) {
+  if(blockIdx.x == 0) {
+    return;
+  }
+  int tx = threadIdx.x;
+  int gx = blockIdx.x*blockDim.x + tx;
+  if(gx < len) {
+    input[gx] += aux[blockIdx.x-1];
+  }
 }
 
 int main(int argc, char **argv) {
@@ -31,6 +86,8 @@ int main(int argc, char **argv) {
   float *hostOutput; // The output list
   float *deviceInput;
   float *deviceOutput;
+  float *deviceaux;
+  float *devicescanaux;
   int numElements; // number of elements in the list
 
   args = wbArg_read(argc, argv);
@@ -42,14 +99,21 @@ int main(int argc, char **argv) {
 
   wbLog(TRACE, "The number of input elements in the input is ",
         numElements);
-
+  // Note: the last element of the last block donot need to be scanned, the first block donot need to be postprocessed
+  size_t numblock = (numElements-1)/(BLOCK_SIZE<<1) + 1; // One block take care of two elements
   wbTime_start(GPU, "Allocating GPU memory.");
   wbCheck(cudaMalloc((void **)&deviceInput, numElements * sizeof(float)));
   wbCheck(cudaMalloc((void **)&deviceOutput, numElements * sizeof(float)));
+  wbCheck(cudaMalloc((void **)&deviceaux, (numblock)*sizeof(float)));
+  wbCheck(cudaMalloc((void **)&devicescanaux, (numblock)*sizeof(float)));
+
   wbTime_stop(GPU, "Allocating GPU memory.");
 
   wbTime_start(GPU, "Clearing output memory.");
   wbCheck(cudaMemset(deviceOutput, 0, numElements * sizeof(float)));
+  wbCheck(cudaMemset(deviceaux, 0, (numblock) * sizeof(float)));
+  wbCheck(cudaMemset(devicescanaux, 0, (numblock) * sizeof(float)));
+
   wbTime_stop(GPU, "Clearing output memory.");
 
   wbTime_start(GPU, "Copying input memory to the GPU.");
@@ -58,11 +122,21 @@ int main(int argc, char **argv) {
   wbTime_stop(GPU, "Copying input memory to the GPU.");
 
   //@@ Initialize the grid and block dimensions here
-
+  // first and third stage dim
+  dim3 ScanGridDim(numblock, 1, 1);
+  dim3 ScanBlockDim(BLOCK_SIZE, 1, 1);
+  // second stage dim
+  dim3 Scan2GridDim(1, 1, 1);
+  dim3 Scan2BlockDim(BLOCK_SIZE, 1, 1);
+  // third stage dim
+  dim3 AddGridDim(numblock, 1, 1);
+  dim3 AddBlockDim(BLOCK_SIZE<<1, 1, 1);
   wbTime_start(Compute, "Performing CUDA computation");
   //@@ Modify this to complete the functionality of the scan
   //@@ on the deivce
-
+  scan<<<ScanGridDim, ScanBlockDim>>>(deviceInput,deviceaux, deviceOutput, numElements,true);
+  scan<<<Scan2GridDim, Scan2BlockDim>>>(deviceaux, nullptr, devicescanaux, numblock,false);
+  add<<<AddGridDim, AddBlockDim>>>(deviceOutput, devicescanaux, numElements);
   cudaDeviceSynchronize();
   wbTime_stop(Compute, "Performing CUDA computation");
 
