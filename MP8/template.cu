@@ -1,5 +1,5 @@
 #include <wb.h>
-
+#define BLOCK_SIZE 512
 #define wbCheck(stmt)                                                     \
   do {                                                                    \
     cudaError_t err = stmt;                                               \
@@ -14,6 +14,16 @@ __global__ void spmvJDSKernel(float *out, int *matColStart, int *matCols,
                               int *matRowPerm, int *matRows,
                               float *matData, float *vec, int dim) {
   //@@ insert spmv kernel for jds format
+  int row = blockDim.x * blockIdx.x + threadIdx.x;
+  if(row < dim){ 
+    float dot = 0;
+    int sec = 0;
+    while(matRows[row] > sec){
+      dot += matData[matColStart[sec] + row] * vec[matCols[matColStart[sec] + row]];
+      sec++;
+    }
+    out[matRowPerm[row]] = dot;
+  }
 }
 
 static void spmvJDS(float *out, int *matColStart, int *matCols,
@@ -21,6 +31,11 @@ static void spmvJDS(float *out, int *matColStart, int *matCols,
                     float *vec, int dim) {
 
   //@@ invoke spmv kernel for jds format
+  dim3 blockDim(dim/BLOCK_SIZE+1,1,1);
+  dim3 gridDim(BLOCK_SIZE,1,1);
+  
+  spmvJDSKernel<<<gridDim, blockDim>>>(out, matColStart, matCols, matRowPerm,
+                                      matRows, matData, vec, dim);
 }
 
 int main(int argc, char **argv) {
@@ -70,6 +85,7 @@ int main(int argc, char **argv) {
 
   cudaMalloc((void **)&deviceVector, sizeof(float) * dim);
   cudaMalloc((void **)&deviceOutput, sizeof(float) * dim);
+  
   wbTime_stop(GPU, "Allocating GPU memory.");
 
   wbTime_start(GPU, "Copying input memory to the GPU.");
